@@ -19,6 +19,29 @@ class VitPoseExtractor:
         self.flip_test = True
         self.tqdm_leave = tqdm_leave
 
+    def _auto_batch_size(self, sample_input, target_util=0.85):
+        """Probe GPU to find optimal batch size for ViTPose."""
+        device = sample_input.device
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
+        baseline = torch.cuda.memory_allocated(device)
+
+        test_bs = 2
+        test_input = sample_input.expand(test_bs, -1, -1, -1)
+        with torch.no_grad():
+            _ = self.pose(test_input)
+        peak = torch.cuda.max_memory_allocated(device)
+        per_sample = (peak - baseline) / test_bs
+        del test_input, _
+        torch.cuda.empty_cache()
+
+        total = torch.cuda.get_device_properties(device).total_memory
+        available = total * target_util - baseline
+        # Cap at 256 to avoid OOM from flip_test doubling (actual forward uses 2*batch_size)
+        optimal = max(1, min(256, int(available / max(per_sample * 3, 1))))
+        print(f"  [Auto BS] ViTPose: {total/1e9:.1f}GB GPU, {per_sample/1e6:.0f}MB/sample -> batch_size={optimal}")
+        return optimal
+
     @torch.no_grad()
     def extract(self, video_path, bbx_xys, img_ds=0.5):
         # Get the batch
@@ -30,7 +53,10 @@ class VitPoseExtractor:
 
         # Inference
         L, _, H, W = imgs.shape  # (L, 3, H, W)
-        batch_size = 16
+        # Probe auto batch size with a single sample
+        probe_input = imgs[0:1, :, :, 32:224].cuda()
+        batch_size = self._auto_batch_size(probe_input)
+        del probe_input
         vitpose = []
         for j in tqdm(range(0, L, batch_size), desc="ViTPose", leave=self.tqdm_leave):
             # Heat map

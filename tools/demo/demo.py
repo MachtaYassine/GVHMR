@@ -52,6 +52,7 @@ def parse_args_to_cfg():
         "If the camera zoom in a lot, you can try 135, 200 or even larger values.",
     )
     parser.add_argument("--verbose", action="store_true", help="If true, draw intermediate results")
+    parser.add_argument("--no_render", action="store_true", help="If true, skip rendering videos (only save params)")
     args = parser.parse_args()
 
     # Input
@@ -67,6 +68,7 @@ def parse_args_to_cfg():
             f"static_cam={args.static_cam}",
             f"verbose={args.verbose}",
             f"use_dpvo={args.use_dpvo}",
+            f"no_render={args.no_render}",
         ]
         if args.f_mm is not None:
             overrides.append(f"f_mm={args.f_mm}")
@@ -327,8 +329,11 @@ if __name__ == "__main__":
         torch.save(pred, paths.hmr4d_results)
 
     # ===== Render ===== #
-    render_incam(cfg)
-    render_global(cfg)
-    if not Path(paths.incam_global_horiz_video).exists():
-        Log.info("[Merge Videos]")
-        merge_videos_horizontal([paths.incam_video, paths.global_video], paths.incam_global_horiz_video)
+    if not cfg.get("no_render", False):
+        render_incam(cfg)
+        render_global(cfg)
+        if not Path(paths.incam_global_horiz_video).exists():
+            Log.info("[Merge Videos]")
+            merge_videos_horizontal([paths.incam_video, paths.global_video], paths.incam_global_horiz_video)
+    else:
+        Log.info("[Render] Skipped (--no_render)")

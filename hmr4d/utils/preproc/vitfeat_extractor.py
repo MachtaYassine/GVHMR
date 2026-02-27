@@ -62,6 +62,28 @@ class Extractor:
         self.extractor: HMR2 = load_hmr2().cuda().eval()
         self.tqdm_leave = tqdm_leave
 
+    def _auto_batch_size(self, sample_input, target_util=0.85):
+        """Probe GPU to find optimal batch size."""
+        device = sample_input.device
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
+        baseline = torch.cuda.memory_allocated(device)
+
+        test_bs = 2
+        test_input = sample_input.expand(test_bs, -1, -1, -1)
+        with torch.no_grad():
+            _ = self.extractor({"img": test_input})
+        peak = torch.cuda.max_memory_allocated(device)
+        per_sample = (peak - baseline) / test_bs
+        del test_input, _
+        torch.cuda.empty_cache()
+
+        total = torch.cuda.get_device_properties(device).total_memory
+        available = total * target_util - baseline
+        optimal = max(1, min(512, int(available / max(per_sample, 1))))
+        print(f"  [Auto BS] HMR2 Feature: {total/1e9:.1f}GB GPU, {per_sample/1e6:.0f}MB/sample -> batch_size={optimal}")
+        return optimal
+
     def extract_video_features(self, video_path, bbx_xys, img_ds=0.5):
         """
         img_ds makes the image smaller, which is useful for faster processing
@@ -76,7 +98,7 @@ class Extractor:
         # Inference
         F, _, H, W = imgs.shape  # (F, 3, H, W)
         imgs = imgs.cuda()
-        batch_size = 16  # 5GB GPU memory, occupies all CUDA cores of 3090
+        batch_size = self._auto_batch_size(imgs[:1])
         features = []
         for j in tqdm(range(0, F, batch_size), desc="HMR2 Feature", leave=self.tqdm_leave):
             imgs_batch = imgs[j : j + batch_size]
