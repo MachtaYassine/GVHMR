@@ -94,7 +94,7 @@ def parse_args_to_cfg():
         writer.close()
         reader.close()
 
-    return cfg
+    return cfg, args
 
 
 @torch.no_grad()
@@ -306,7 +306,7 @@ def render_global(cfg):
 
 
 if __name__ == "__main__":
-    cfg = parse_args_to_cfg()
+    cfg, args = parse_args_to_cfg()
     paths = cfg.paths
     Log.info(f"[GPU]: {torch.cuda.get_device_name()}")
     Log.info(f'[GPU]: {torch.cuda.get_device_properties("cuda")}')
