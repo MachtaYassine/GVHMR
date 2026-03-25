@@ -24,21 +24,31 @@ class VitPoseExtractor:
         device = sample_input.device
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(device)
-        baseline = torch.cuda.memory_allocated(device)
 
-        test_bs = 2
+        # Probe with bs=1 to get fixed overhead
+        with torch.no_grad():
+            _ = self.pose(sample_input)
+        peak1 = torch.cuda.max_memory_allocated(device)
+        del _
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
+
+        # Probe with bs=4 to get marginal cost
+        test_bs = 4
         test_input = sample_input.expand(test_bs, -1, -1, -1)
         with torch.no_grad():
             _ = self.pose(test_input)
-        peak = torch.cuda.max_memory_allocated(device)
-        per_sample = (peak - baseline) / test_bs
+        peak4 = torch.cuda.max_memory_allocated(device)
+        per_sample = (peak4 - peak1) / (test_bs - 1)
         del test_input, _
         torch.cuda.empty_cache()
 
         total = torch.cuda.get_device_properties(device).total_memory
-        available = total * target_util - baseline
+        available = total * target_util - peak1
         # Cap at 256 to avoid OOM from flip_test doubling (actual forward uses 2*batch_size)
         optimal = max(1, min(256, int(available / max(per_sample * 3, 1))))
+        if total < 12e9:
+            optimal = max(1, optimal // 2)
         print(f"  [Auto BS] ViTPose: {total/1e9:.1f}GB GPU, {per_sample/1e6:.0f}MB/sample -> batch_size={optimal}")
         return optimal
 

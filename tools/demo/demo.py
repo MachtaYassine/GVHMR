@@ -1,3 +1,5 @@
+import gc
+import io
 import cv2
 import torch
 import pytorch_lightning as pl
@@ -7,6 +9,16 @@ from hmr4d.utils.pylogger import Log
 import hydra
 from hydra import initialize_config_module, compose
 from pathlib import Path
+
+# Buffered torch.load: avoids Lustre small-read latency (12x faster under IO contention)
+_torch_load_orig = torch.load
+def _torch_load_buffered(f, *a, **kw):
+    kw.setdefault("weights_only", False)
+    if isinstance(f, (str, Path)):
+        with open(f, "rb") as fh:
+            return _torch_load_orig(io.BytesIO(fh.read()), *a, **kw)
+    return _torch_load_orig(f, *a, **kw)
+torch.load = _torch_load_buffered
 from pytorch3d.transforms import quaternion_to_matrix
 
 from hmr4d.configs import register_store_gvhmr
@@ -84,15 +96,11 @@ def parse_args_to_cfg():
     Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
     Path(cfg.preprocess_dir).mkdir(parents=True, exist_ok=True)
 
-    # Copy raw-input-video to video_path
-    Log.info(f"[Copy Video] {video_path} -> {cfg.video_path}")
-    if not Path(cfg.video_path).exists() or get_video_lwh(video_path)[0] != get_video_lwh(cfg.video_path)[0]:
-        reader = get_video_reader(video_path)
-        writer = get_writer(cfg.video_path, fps=30, crf=CRF)
-        for img in tqdm(reader, total=get_video_lwh(video_path)[0], desc=f"Copy"):
-            writer.write_frame(img)
-        writer.close()
-        reader.close()
+    # Symlink raw-input-video instead of re-encoding (saves ~4min for long videos)
+    cfg_video = Path(cfg.video_path)
+    if not cfg_video.exists():
+        cfg_video.symlink_to(video_path.resolve())
+        Log.info(f"[Symlink Video] {video_path} -> {cfg.video_path}")
 
     return cfg, args
 
@@ -113,6 +121,7 @@ def run_preprocess(cfg):
         bbx_xys = get_bbx_xys_from_xyxy(bbx_xyxy, base_enlarge=1.2).float()  # (L, 3) apply aspect ratio and enlarge
         torch.save({"bbx_xyxy": bbx_xyxy, "bbx_xys": bbx_xys}, paths.bbx)
         del tracker
+        torch.cuda.empty_cache()
     else:
         bbx_xys = torch.load(paths.bbx)["bbx_xys"]
         Log.info(f"[Preprocess] bbx (xyxy, xys) from {paths.bbx}")
@@ -128,6 +137,7 @@ def run_preprocess(cfg):
         vitpose = vitpose_extractor.extract(video_path, bbx_xys)
         torch.save(vitpose, paths.vitpose)
         del vitpose_extractor
+        torch.cuda.empty_cache()
     else:
         vitpose = torch.load(paths.vitpose)
         Log.info(f"[Preprocess] vitpose from {paths.vitpose}")
@@ -138,6 +148,8 @@ def run_preprocess(cfg):
 
     # Get vit features
     if not Path(paths.vit_features).exists():
+        gc.collect()
+        torch.cuda.empty_cache()
         extractor = Extractor()
         vit_features = extractor.extract_video_features(video_path, bbx_xys)
         torch.save(vit_features, paths.vit_features)

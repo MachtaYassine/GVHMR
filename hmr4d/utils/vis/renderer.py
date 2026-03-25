@@ -10,7 +10,7 @@ from pytorch3d.renderer import (
     RasterizationSettings,
     MeshRenderer,
     MeshRasterizer,
-    SoftPhongShader,
+    HardPhongShader,
 )
 from pytorch3d.structures import Meshes
 from pytorch3d.structures.meshes import join_meshes_as_scene
@@ -103,11 +103,12 @@ def compute_bbox_from_points(X, img_w, img_h, scaleFactor=1.2):
 
 
 class Renderer:
-    def __init__(self, width, height, focal_length=None, device="cuda", faces=None, K=None, bin_size=None):
-        """set bin_size to 0 for no binning"""
+    def __init__(self, width, height, focal_length=None, device="cuda", faces=None, K=None, bin_size=None, render_scale=1.0):
+        """set bin_size to 0 for no binning. render_scale<1.0 renders at lower res then upscales."""
         self.width = width
         self.height = height
         self.bin_size = bin_size
+        self.render_scale = render_scale
         assert (focal_length is not None) ^ (K is not None), "focal_length and K are mutually exclusive"
 
         self.device = device
@@ -121,13 +122,19 @@ class Renderer:
         self.create_renderer()
 
     def create_renderer(self):
+        img_size = self.image_sizes[0]
+        if self.render_scale != 1.0:
+            img_size = (int(img_size[0] * self.render_scale), int(img_size[1] * self.render_scale))
         self.renderer = MeshRenderer(
             rasterizer=MeshRasterizer(
                 raster_settings=RasterizationSettings(
-                    image_size=self.image_sizes[0], blur_radius=1e-5, bin_size=self.bin_size
+                    image_size=img_size,
+                    blur_radius=0.0,
+                    bin_size=0,
+                    cull_backfaces=True,
                 ),
             ),
-            shader=SoftPhongShader(
+            shader=HardPhongShader(
                 device=self.device,
                 lights=self.lights,
             ),
@@ -139,8 +146,17 @@ class Renderer:
         if T is not None:
             self.T = T.clone().view(1, 3).to(self.device)
 
+        K_cam = self.K_full
+        img_sizes = self.image_sizes
+        if self.render_scale != 1.0:
+            s = self.render_scale
+            K_cam = self.K_full.clone()
+            K_cam[0, 0, :3] *= s  # scale fx, skew, cx
+            K_cam[0, 1, :3] *= s  # scale fy, cy
+            img_sizes = [(int(h * s), int(w * s)) for h, w in self.image_sizes]
+
         return PerspectiveCameras(
-            device=self.device, R=self.R.mT, T=self.T, K=self.K_full, image_size=self.image_sizes, in_ndc=False
+            device=self.device, R=self.R.mT, T=self.T, K=K_cam, image_size=img_sizes, in_ndc=False
         )
 
     def initialize_camera_params(self, focal_length, K):
@@ -208,7 +224,7 @@ class Renderer:
         self.create_renderer()
 
     def render_mesh(self, vertices, background=None, colors=[0.8, 0.8, 0.8], VI=50):
-        self.update_bbox(vertices[::VI], scale=1.2)
+        # Render at full resolution — no per-frame renderer recreation
         vertices = vertices.unsqueeze(0)
 
         if isinstance(colors, torch.Tensor):
@@ -231,15 +247,20 @@ class Renderer:
         materials = Materials(device=self.device, specular_color=(colors,), shininess=0)
 
         results = torch.flip(self.renderer(mesh, materials=materials, cameras=self.cameras, lights=self.lights), [1, 2])
-        image = results[0, ..., :3] * 255
-        mask = results[0, ..., -1] > 1e-3
+        image = (results[0, ..., :3] * 255).byte().cpu().numpy()
+        mask = (results[0, ..., -1] > 1e-3).cpu().numpy()
+
+        # Upscale if rendered at lower resolution
+        if self.render_scale != 1.0:
+            image = cv2.resize(image, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
+            mask = cv2.resize(mask.astype(np.uint8), (self.width, self.height), interpolation=cv2.INTER_NEAREST).astype(bool)
 
         if background is None:
-            background = np.ones((self.height, self.width, 3)).astype(np.uint8) * 255
+            background = np.ones((self.height, self.width, 3), dtype=np.uint8) * 255
 
-        image = overlay_image_onto_background(image, mask, self.bboxes, background.copy())
-        self.reset_bbox()
-        return image
+        out = background.copy()
+        out[mask] = image[mask]
+        return out
 
     def render_with_ground(self, verts, colors, cameras, lights, faces=None):
         """
@@ -271,6 +292,9 @@ class Renderer:
 
         results = self.renderer(mesh, cameras=cameras, lights=lights, materials=materials)
         image = (results[0, ..., :3].cpu().numpy() * 255).astype(np.uint8)
+
+        if self.render_scale != 1.0:
+            image = cv2.resize(image, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
 
         return image
 

@@ -75,17 +75,23 @@ def save_video(images, video_path, fps=30, crf=17):
     elif isinstance(images, list):
         images = np.array(images).astype(np.uint8)
 
-    with iio.imopen(video_path, "w", plugin="pyav") as writer:
-        writer.init_video_stream("libx264", fps=fps)
-        writer._video_stream.options = {"crf": str(crf)}
-        writer.write(images)
+    writer = get_writer(video_path, fps=fps, crf=crf)
+    writer.write(images)
+    writer.close()
 
 
 def get_writer(video_path, fps=30, crf=17):
-    """remember to .close()"""
+    """Create a video writer. Tries h264_nvenc (GPU) first, falls back to libx264 (CPU)."""
     writer = iio.imopen(video_path, "w", plugin="pyav")
-    writer.init_video_stream("libx264", fps=fps)
-    writer._video_stream.options = {"crf": str(crf)}
+    try:
+        writer.init_video_stream("h264_nvenc", fps=fps)
+        # NVENC uses qp instead of crf; roughly crf17→qp20, crf23→qp26
+        qp = crf + 3
+        writer._video_stream.options = {"qp": str(qp), "preset": "p4"}
+    except Exception:
+        writer = iio.imopen(video_path, "w", plugin="pyav")
+        writer.init_video_stream("libx264", fps=fps)
+        writer._video_stream.options = {"crf": str(crf)}
     return writer
 
 
