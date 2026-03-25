@@ -118,10 +118,9 @@ class Extractor:
         total = torch.cuda.get_device_properties(device).total_memory
         available = total * target_util - peak1
         optimal = max(1, min(128, int(available / max(per_sample, 1))))
-        # Safety: on small GPUs (<12GB), ViT attention/MLP intermediates scale
-        # worse than the linear probe suggests. Halve the estimate.
+        # Safety: ViT attention/MLP intermediates scale worse than probes suggest.
         if total < 12e9:
-            optimal = max(1, optimal // 2)
+            optimal = max(1, optimal // 4)
         print(f"  [Auto BS] HMR2 Feature: {total/1e9:.1f}GB GPU, {per_sample/1e6:.0f}MB/sample, fixed={peak1/1e6:.0f}MB -> batch_size={optimal}")
         return optimal
 

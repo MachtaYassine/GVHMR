@@ -48,7 +48,7 @@ class VitPoseExtractor:
         # Cap at 256 to avoid OOM from flip_test doubling (actual forward uses 2*batch_size)
         optimal = max(1, min(256, int(available / max(per_sample * 3, 1))))
         if total < 12e9:
-            optimal = max(1, optimal // 2)
+            optimal = max(1, optimal // 4)
         print(f"  [Auto BS] ViTPose: {total/1e9:.1f}GB GPU, {per_sample/1e6:.0f}MB/sample -> batch_size={optimal}")
         return optimal
 
