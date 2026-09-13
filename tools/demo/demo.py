@@ -63,6 +63,9 @@ def parse_args_to_cfg():
         "For iPhone 15p, the [0.5x, 1x, 2x, 3x] lens have typical values [13, 24, 48, 77]."
         "If the camera zoom in a lot, you can try 135, 200 or even larger values.",
     )
+    # vid2smplx patch: pick which person to reconstruct when several are in frame.
+    parser.add_argument("--person", type=int, default=0,
+                        help="Which person to reconstruct: rank in the area-sorted track list (0 = largest)")
     parser.add_argument("--verbose", action="store_true", help="If true, draw intermediate results")
     parser.add_argument("--no_render", action="store_true", help="If true, skip rendering videos (only save params)")
     args = parser.parse_args()
@@ -81,6 +84,7 @@ def parse_args_to_cfg():
             f"verbose={args.verbose}",
             f"use_dpvo={args.use_dpvo}",
             f"no_render={args.no_render}",
+            f"+person={args.person}",   # vid2smplx patch
         ]
         if args.f_mm is not None:
             overrides.append(f"f_mm={args.f_mm}")
@@ -117,9 +121,13 @@ def run_preprocess(cfg):
     # Get bbx tracking result
     if not Path(paths.bbx).exists():
         tracker = Tracker()
-        bbx_xyxy = tracker.get_one_track(video_path).float()  # (L, 4)
+        bbx_xyxy = tracker.get_one_track(video_path, rank=cfg.get("person", 0)).float()  # (L, 4)
         bbx_xys = get_bbx_xys_from_xyxy(bbx_xyxy, base_enlarge=1.2).float()  # (L, 3) apply aspect ratio and enlarge
-        torch.save({"bbx_xyxy": bbx_xyxy, "bbx_xys": bbx_xys}, paths.bbx)
+        # vid2smplx patch: track_summary travels with the bbx -- only one person is
+        # reconstructed, and the orchestrator must be able to say so when more than
+        # one was in frame.
+        torch.save({"bbx_xyxy": bbx_xyxy, "bbx_xys": bbx_xys,
+                    "track_summary": tracker.track_summary}, paths.bbx)
         del tracker
         torch.cuda.empty_cache()
     else:
