@@ -126,7 +126,7 @@ def run_preprocess(cfg):
         # vid2smplx patch: track_summary travels with the bbx -- only one person is
         # reconstructed, and the orchestrator must be able to say so when more than
         # one was in frame.
-        torch.save({"bbx_xyxy": bbx_xyxy, "bbx_xys": bbx_xys,
+        save_atomic({"bbx_xyxy": bbx_xyxy, "bbx_xys": bbx_xys,
                     "track_summary": tracker.track_summary}, paths.bbx)
         del tracker
         torch.cuda.empty_cache()
@@ -143,7 +143,7 @@ def run_preprocess(cfg):
     if not Path(paths.vitpose).exists():
         vitpose_extractor = VitPoseExtractor()
         vitpose = vitpose_extractor.extract(video_path, bbx_xys)
-        torch.save(vitpose, paths.vitpose)
+        save_atomic(vitpose, paths.vitpose)
         del vitpose_extractor
         torch.cuda.empty_cache()
     else:
@@ -160,7 +160,7 @@ def run_preprocess(cfg):
         torch.cuda.empty_cache()
         extractor = Extractor()
         vit_features = extractor.extract_video_features(video_path, bbx_xys)
-        torch.save(vit_features, paths.vit_features)
+        save_atomic(vit_features, paths.vit_features)
         del extractor
     else:
         Log.info(f"[Preprocess] vit_features from {paths.vit_features}")
@@ -171,7 +171,7 @@ def run_preprocess(cfg):
             if not cfg.use_dpvo:
                 simple_vo = SimpleVO(cfg.video_path, scale=0.5, step=8, method="sift", f_mm=cfg.f_mm)
                 vo_results = simple_vo.compute()  # (L, 4, 4), numpy
-                torch.save(vo_results, paths.slam)
+                save_atomic(vo_results, paths.slam)
             else:  # DPVO
                 from hmr4d.utils.preproc.slam import SLAMModel
 
@@ -187,11 +187,27 @@ def run_preprocess(cfg):
                     else:
                         break
                 slam_results = slam.process()  # (L, 7), numpy
-                torch.save(slam_results, paths.slam)
+                save_atomic(slam_results, paths.slam)
         else:
             Log.info(f"[Preprocess] slam results from {paths.slam}")
 
     Log.info(f"[Preprocess] End. Time elapsed: {Log.time()-tic:.2f}s")
+
+
+
+def save_atomic(obj, path):
+    """torch.save via temp + rename: a SIGKILL can never leave a partial checkpoint
+    at `path`, where the `.exists()` reuse checks below would bless it as complete."""
+    import os, tempfile
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".pt")
+    os.close(fd)
+    try:
+        torch.save(obj, tmp)
+        os.replace(tmp, path)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
 
 
 def load_data_dict(cfg):
@@ -346,7 +362,7 @@ if __name__ == "__main__":
         pred = detach_to_cpu(pred)
         data_time = data["length"] / 30
         Log.info(f"[HMR4D] Elapsed: {Log.sync_time() - tic:.2f}s for data-length={data_time:.1f}s")
-        torch.save(pred, paths.hmr4d_results)
+        save_atomic(pred, paths.hmr4d_results)
 
     # ===== Render ===== #
     if not cfg.get("no_render", False):

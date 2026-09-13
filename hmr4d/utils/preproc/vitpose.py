@@ -25,7 +25,7 @@ class VitPoseExtractor:
         """The only ViTPose forward. fp16, NOT bf16: bf16 measured 0.67x (slower) on
         sm_7.5, which has no bf16 tensor cores and is the card these jobs land on.
         VID2SMPLX_VITPOSE_FP16=0 is the fp32 control for A/B validation."""
-        enabled = os.environ.get("VID2SMPLX_VITPOSE_FP16", "1") != "0"
+        enabled = os.environ.get("VID2SMPLX_VITPOSE_FP16", "0") != "0"
         with torch.autocast("cuda", dtype=torch.float16, enabled=enabled):
             return self.pose(x).float()
 
