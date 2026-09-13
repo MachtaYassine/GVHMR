@@ -8,6 +8,17 @@ from einops import einsum, rearrange, repeat
 from hmr4d.network.base_arch.embeddings.rotary_embedding import ROPE
 
 
+class BandMask:
+    """A banded attention window, described by per-query [lo, hi) key bounds.
+
+    Stands in for a dense (L, L) bool mask without ever materialising one: at
+    L=35,755 the dense path needs a 38.10 GiB (B, heads, L, L) fp32 score tensor.
+    """
+
+    def __init__(self, lo, hi, block=2048):
+        self.lo, self.hi, self.block = lo, hi, block
+
+
 class RoPEAttention(nn.Module):
     def __init__(self, embed_dim, num_heads, dropout=0.1):
         super().__init__()
@@ -37,6 +48,11 @@ class RoPEAttention(nn.Module):
         xq = self.rope.rotate_queries_or_keys(xq)  # B, N, L, C
         xk = self.rope.rotate_queries_or_keys(xk)  # B, N, L, C
 
+        if isinstance(attn_mask, BandMask):
+            output = self._banded(xq, xk, xv, attn_mask, key_padding_mask)
+            output = output.transpose(1, 2).reshape(B, L, -1)
+            return self.proj(output)
+
         attn_score = einsum(xq, xk, "b n i c, b n j c -> b n i j") / math.sqrt(self.head_dim)
         if attn_mask is not None:
             attn_mask = attn_mask.reshape(1, 1, L, L).expand(B, self.num_heads, -1, -1)
@@ -51,6 +67,25 @@ class RoPEAttention(nn.Module):
         output = output.transpose(1, 2).reshape(B, L, -1)  # B, L, C
         output = self.proj(output)  # B, L, C
         return output
+
+    def _banded(self, xq, xk, xv, band, key_padding_mask):
+        """Exact banded attention: each query block reads only keys inside its own band."""
+        B, _, L, _ = xq.shape
+        lo, hi = band.lo, band.hi
+        j = torch.arange(L, device=xq.device)
+        p = self.dropout.p if self.training else 0.0
+        out = torch.empty_like(xq)
+        for a in range(0, L, band.block):
+            b = min(a + band.block, L)
+            ks, ke = int(lo[a:b].min()), int(hi[a:b].max())
+            keep = (j[None, ks:ke] >= lo[a:b, None]) & (j[None, ks:ke] < hi[a:b, None])
+            keep = keep[None, None].expand(B, 1, -1, -1)  # (B,1,b-a,ke-ks)
+            if key_padding_mask is not None:
+                keep = keep & (~key_padding_mask[:, ks:ke])[:, None, None, :]
+            out[:, :, a:b] = F.scaled_dot_product_attention(
+                xq[:, :, a:b], xk[:, :, ks:ke], xv[:, :, ks:ke], attn_mask=keep, dropout_p=p
+            )
+        return out
 
 
 class EncoderRoPEBlock(nn.Module):

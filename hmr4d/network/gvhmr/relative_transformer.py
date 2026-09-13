@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from einops import einsum, rearrange, repeat
 from hmr4d.configs import MainStore, builds
 
-from hmr4d.network.base_arch.transformer.encoder_rope import EncoderRoPEBlock
+from hmr4d.network.base_arch.transformer.encoder_rope import BandMask, EncoderRoPEBlock
 from hmr4d.network.base_arch.transformer.layer import zero_module
 
 from hmr4d.utils.net_utils import length_to_mask
@@ -144,13 +144,13 @@ class NetworkEncoderRoPE(nn.Module):
         pmask = ~length_to_mask(length, L)  # (B, L)
 
         if L > self.max_len:
-            attnmask = torch.ones((L, L), device=x.device, dtype=torch.bool)
-            for i in range(L):
-                min_ind = max(0, i - self.max_len // 2)
-                max_ind = min(L, i + self.max_len // 2)
-                max_ind = max(self.max_len, max_ind)
-                min_ind = min(L - self.max_len, min_ind)
-                attnmask[i, min_ind:max_ind] = False
+            # Same window as the old (L, L) bool mask, kept as bounds so it is never
+            # materialised: at L=35,755 the dense form costs a 38.10 GiB score tensor.
+            i = torch.arange(L, device=x.device)
+            h = self.max_len // 2
+            min_ind = torch.clamp(i - h, min=0).clamp(max=L - self.max_len)
+            max_ind = torch.clamp(i + h, max=L).clamp(min=self.max_len)
+            attnmask = BandMask(min_ind, max_ind)
         else:
             attnmask = None
 
