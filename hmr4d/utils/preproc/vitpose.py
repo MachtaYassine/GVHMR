@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -8,6 +9,7 @@ from tqdm import tqdm
 from hmr4d.utils.kpts.kp2d_utils import keypoints_from_heatmaps
 from hmr4d.utils.geo_transform import cvt_p2d_from_pm1_to_i
 from hmr4d.utils.geo.flip_utils import flip_heatmap_coco17
+from hmr4d.utils.auto_batch import auto_batch_size
 
 
 class VitPoseExtractor:
@@ -19,38 +21,13 @@ class VitPoseExtractor:
         self.flip_test = True
         self.tqdm_leave = tqdm_leave
 
-    def _auto_batch_size(self, sample_input, target_util=0.85):
-        """Probe GPU to find optimal batch size for ViTPose."""
-        device = sample_input.device
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats(device)
-
-        # Probe with bs=1 to get fixed overhead
-        with torch.no_grad():
-            _ = self.pose(sample_input)
-        peak1 = torch.cuda.max_memory_allocated(device)
-        del _
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats(device)
-
-        # Probe with bs=4 to get marginal cost
-        test_bs = 4
-        test_input = sample_input.expand(test_bs, -1, -1, -1)
-        with torch.no_grad():
-            _ = self.pose(test_input)
-        peak4 = torch.cuda.max_memory_allocated(device)
-        per_sample = (peak4 - peak1) / (test_bs - 1)
-        del test_input, _
-        torch.cuda.empty_cache()
-
-        total = torch.cuda.get_device_properties(device).total_memory
-        available = total * target_util - peak1
-        # Cap at 256 to avoid OOM from flip_test doubling (actual forward uses 2*batch_size)
-        optimal = max(1, min(256, int(available / max(per_sample * 3, 1))))
-        if total < 12e9:
-            optimal = max(1, optimal // 4)
-        print(f"  [Auto BS] ViTPose: {total/1e9:.1f}GB GPU, {per_sample/1e6:.0f}MB/sample -> batch_size={optimal}")
-        return optimal
+    def _forward(self, x):
+        """The only ViTPose forward. fp16, NOT bf16: bf16 measured 0.67x (slower) on
+        sm_7.5, which has no bf16 tensor cores and is the card these jobs land on.
+        VID2SMPLX_VITPOSE_FP16=0 is the fp32 control for A/B validation."""
+        enabled = os.environ.get("VID2SMPLX_VITPOSE_FP16", "1") != "0"
+        with torch.autocast("cuda", dtype=torch.float16, enabled=enabled):
+            return self.pose(x).float()
 
     @torch.no_grad()
     def extract(self, video_path, bbx_xys, img_ds=0.5):
@@ -65,19 +42,25 @@ class VitPoseExtractor:
         L, _, H, W = imgs.shape  # (L, 3, H, W)
         # Probe auto batch size with a single sample
         probe_input = imgs[0:1, :, :, 32:224].cuda()
-        batch_size = self._auto_batch_size(probe_input)
+        # safety_factor=3: flip_test doubles the real batch and ViT activations
+        # scale worse than a 1-vs-4 fit predicts.
+        batch_size = auto_batch_size(
+            lambda n: self._forward(probe_input.expand(n, -1, -1, -1)),
+            label="ViTPose", cap=256, device=probe_input.device,
+            safety_factor=3, small_gpu_divisor=4,
+        )
         del probe_input
         vitpose = []
         for j in tqdm(range(0, L, batch_size), desc="ViTPose", leave=self.tqdm_leave):
             # Heat map
             imgs_batch = imgs[j : j + batch_size, :, :, 32:224].cuda()
             if self.flip_test:
-                heatmap, heatmap_flipped = self.pose(torch.cat([imgs_batch, imgs_batch.flip(3)], dim=0)).chunk(2)
+                heatmap, heatmap_flipped = self._forward(torch.cat([imgs_batch, imgs_batch.flip(3)], dim=0)).chunk(2)
                 heatmap_flipped = flip_heatmap_coco17(heatmap_flipped)
                 heatmap = (heatmap + heatmap_flipped) * 0.5
                 del heatmap_flipped
             else:
-                heatmap = self.pose(imgs_batch.clone())  # (B, J, 64, 48)
+                heatmap = self._forward(imgs_batch.clone())  # (B, J, 64, 48)
 
             if False:
                 # Get joint

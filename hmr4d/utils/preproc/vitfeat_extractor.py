@@ -1,5 +1,6 @@
 import torch
 from hmr4d.network.hmr2 import load_hmr2, HMR2
+from hmr4d.utils.auto_batch import auto_batch_size
 
 
 from hmr4d.utils.video_io_utils import read_video_np
@@ -87,43 +88,6 @@ class Extractor:
         self.extractor: HMR2 = load_hmr2().cuda().eval()
         self.tqdm_leave = tqdm_leave
 
-    def _auto_batch_size(self, sample_input, target_util=0.70):
-        """Probe GPU to find optimal batch size.
-
-        Uses two probe sizes to estimate both fixed overhead and per-sample cost,
-        which is important for ViT models where attention memory scales with batch size.
-        """
-        device = sample_input.device
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats(device)
-
-        # Probe with bs=1 to get fixed overhead
-        with torch.no_grad():
-            _ = self.extractor({"img": sample_input})
-        peak1 = torch.cuda.max_memory_allocated(device)
-        del _
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats(device)
-
-        # Probe with bs=4 to get better per-sample estimate
-        test_bs = 4
-        test_input = sample_input.expand(test_bs, -1, -1, -1)
-        with torch.no_grad():
-            _ = self.extractor({"img": test_input})
-        peak4 = torch.cuda.max_memory_allocated(device)
-        per_sample = (peak4 - peak1) / (test_bs - 1)
-        del test_input, _
-        torch.cuda.empty_cache()
-
-        total = torch.cuda.get_device_properties(device).total_memory
-        available = total * target_util - peak1
-        optimal = max(1, min(128, int(available / max(per_sample, 1))))
-        # Safety: ViT attention/MLP intermediates scale worse than probes suggest.
-        if total < 12e9:
-            optimal = max(1, optimal // 4)
-        print(f"  [Auto BS] HMR2 Feature: {total/1e9:.1f}GB GPU, {per_sample/1e6:.0f}MB/sample, fixed={peak1/1e6:.0f}MB -> batch_size={optimal}")
-        return optimal
-
     def extract_video_features(self, video_path, bbx_xys, img_ds=0.5):
         """
         img_ds makes the image smaller, which is useful for faster processing
@@ -138,7 +102,13 @@ class Extractor:
         # Inference
         F, _, H, W = imgs.shape  # (F, 3, H, W)
         # Keep frames on CPU, move only each batch to GPU to avoid OOM on small GPUs
-        batch_size = self._auto_batch_size(imgs[:1].cuda())
+        probe_input = imgs[:1].cuda()
+        batch_size = auto_batch_size(
+            lambda n: self.extractor({"img": probe_input.expand(n, -1, -1, -1)}),
+            label="HMR2 Feature", cap=128, device=probe_input.device,
+            target_util=0.70, small_gpu_divisor=4,
+        )
+        del probe_input
         features = []
         for j in tqdm(range(0, F, batch_size), desc="HMR2 Feature", leave=self.tqdm_leave):
             imgs_batch = imgs[j : j + batch_size].cuda()
